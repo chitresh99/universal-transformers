@@ -41,6 +41,9 @@ This document explains the paper with intuition first and technical detail after
 
 A standard Transformer stacks a fixed number of layers (for example 6), and each layer has its own weights. The Universal Transformer (UT) keeps one Transformer layer and applies it repeatedly, with the same weights every time, so every token's representation is refined over several passes. This turns the Transformer into a recurrent model where the recurrence runs over depth (revisions of the representation), not over sequence positions. A timestep embedding tells the shared layer which pass it is on. An optional per-token halting mechanism (Adaptive Computation Time) lets each token decide how many passes it needs. The paper argues this adds the inductive bias of RNNs (learning repeatable procedures) to the Transformer, makes the model computationally universal under certain assumptions, and shows gains on algorithmic tasks, bAbI, subject-verb agreement, LAMBADA, and WMT14 English-German translation.
 
+
+A Universal Transformer is a Transformer where instead of stacking six different layers, you take one layer and apply it over and over with the same weights. Each pass refines every word's representation a bit more, so the weights stay fixed while the representation improves. That makes it recurrent over depth rather than over words, and because depth is no longer tied to the parameter count, you can run as many passes as you want, or let each word decide for itself when to stop
+
 ---
 
 ## 2. Intuition first
