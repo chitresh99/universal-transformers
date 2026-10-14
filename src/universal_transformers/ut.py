@@ -480,3 +480,66 @@ def check_overfit(cfg: Config):
     char, seq = evaluate(model, subset, small)
     print(f"  memorized       char-acc {char:.0%}  seq-acc {seq:.0%}  of 32 examples")
     return seq
+
+#####################################
+# Main
+#####################################
+
+
+def main():
+    cfg = Config()
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+
+    train_ex, valid_ex = build_dataset(cfg)
+
+    print("Data")
+    task, src, tgt = train_ex[0]
+    print(f"  task            {task}")
+    print(f"  source          {decode_tokens(src)}")
+    print(f"  target          {decode_tokens(tgt)}")
+    si, ti = tensorize(train_ex[0])
+    print(f"  source ids      {si}   (content + <eos>)")
+    print(f"  target ids      {ti}   (<sos> + content + <eos>)")
+    print(f"  vocab           {vocab_size(cfg)} ({cfg.num_symbols} content symbols)")
+    print(f"  tasks           {cfg.tasks}   len {cfg.min_len}-{cfg.max_len}")
+    print(f"  examples        {len(train_ex)} train / {len(valid_ex)} valid")
+
+    print("\nShapes")
+    model = UniversalTransformer(cfg).to(cfg.device)
+    check_shapes(model, cfg)
+
+    print("\nOverfit check")
+    check_overfit(cfg)
+
+    print("\nTraining")
+    model = UniversalTransformer(cfg).to(cfg.device)
+    train(model, train_ex, cfg)
+
+    print("\nHeld-out accuracy (char-acc / seq-acc)")
+    for task, (char, seq) in evaluate_by_task(model, valid_ex, cfg).items():
+        print(f"  {task:8s}        char {char:.1%}   seq {seq:.1%}")
+    char, seq = evaluate(model, valid_ex, cfg)
+    print(f"  {'overall':8s}        char {char:.1%}   seq {seq:.1%}")
+
+    print("\nSamples (with per-position ponder times)")
+    model.eval()
+    for ex in valid_ex[:3]:
+        si, _ = tensorize(ex)
+        src = torch.tensor([si], device=cfg.device)
+        with torch.no_grad():
+            enc, src_mask, enc_ponder = model.encode(src)
+            pred = greedy_decode(model, src, cfg)
+        p = strip(pred[0].tolist())
+        print(f"  task            {ex[0]}")
+        print(f"  source          {decode_tokens(ex[1])}")
+        print(f"  target          {decode_tokens(ex[2])}")
+        print(f"  predicted       {decode_tokens(p)}")
+        ponder = enc_ponder[0].tolist()
+        print(f"  enc ponder/pos  {[round(x, 1) for x in ponder]}  "
+              f"(avg {sum(ponder)/len(ponder):.2f} of max {cfg.max_steps})")
+        print()
+
+
+if __name__ == "__main__":
+    main()
