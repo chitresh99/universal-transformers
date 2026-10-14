@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Tuple, List
 import random
+import math
 
 import torch
 import torch.nn as nn
@@ -156,3 +157,78 @@ def coordinate_embedding(seq_len: int, step: int, d_model: int, device) -> torch
         t / div
     )  # ODD dims: cosine of position + cosine of timestep, summed (Eqn 7)
     return pe  # (L, d_model) one coordinate embedding for THIS step, added to the state in act_halt
+
+
+#####################################
+# Recurrent block (shared across time steps)
+#####################################
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        assert cfg.d_model % cfg.num_heads == 0
+        self.h = cfg.num_heads
+        self.dk = cfg.d_model // cfg.num_heads
+        self.q = nn.Linear(cfg.d_model, cfg.d_model)
+        self.k = nn.Linear(cfg.d_model, cfg.d_model)
+        self.v = nn.Linear(cfg.d_model, cfg.d_model)
+        self.o = nn.Linear(cfg.d_model, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, query, key_value, mask=None):
+        B, Lq, _ = query.shape
+        Lk = key_value.size(1)
+
+        def split(x, L):
+            return x.view(B, L, self.h, self.dk).transpose(1, 2)
+
+        Q = split(self.q(query), Lq)
+        K = split(self.k(key_value), Lk)
+        V = split(self.v(key_value), Lk)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.dk)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+        attn = self.drop(F.softmax(scores, dim=-1))
+        ctx = torch.matmul(attn, V)  # (B, h, Lq, dk)
+        ctx = ctx.transpose(1, 2).contiguous().view(B, Lq, self.h * self.dk)
+        return self.o(ctx)
+
+
+class Transition(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_ff),
+            nn.ReLU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_ff, cfg.d_model),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class UTBlock(nn.Module):
+    def __init__(self, cfg: Config, is_decoder: bool):
+        super().__init__()
+        self.is_decoder = is_decoder
+        self.self_attn = MultiHeadSelfAttention(cfg)
+        self.norm1 = nn.LayerNorm(cfg.d_model)
+        if is_decoder:
+            self.cross_attn = MultiHeadSelfAttention(cfg)
+            self.norm_cross = nn.LayerNorm(cfg.d_model)
+        self.transition = Transition(cfg)
+        self.norm2 = nn.LayerNorm(cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, h, self_mask=None, enc=None, cross_mask=None):
+        a = self.self_attn(h, h, mask=self_mask)
+        h = self.norm1(h + self.drop(a))
+        if self.is_decoder:
+            c = self.cross_attn(h, enc, mask=cross_mask)
+            h = self.norm_cross(h + self.drop(c))
+        t = self.transition(h)
+        h = self.norm2(h + self.drop(t))
+        return h    
