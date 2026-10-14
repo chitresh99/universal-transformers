@@ -331,3 +331,59 @@ class UniversalTransformer(nn.Module):
         enc, src_mask, enc_ponder = self.encode(src)
         logits, dec_ponder = self.decode(tgt_in, enc, src_mask)
         return logits, enc_ponder, dec_ponder
+
+
+#####################
+# Training
+#####################
+
+
+def lr_at(step, cfg: Config):
+    step = max(step, 1)
+    return (
+        cfg.lr
+        * min(step**-0.5, step * cfg.warmup_steps**-1.5)
+        * (cfg.warmup_steps**0.5)
+    )
+
+
+def compute_loss(model, src, tgt, cfg: Config):
+    tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
+    logits, enc_ponder, dec_ponder = model(src, tgt_in)
+    ce = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        tgt_out.reshape(-1),
+        ignore_index=PAD,
+        label_smoothing=cfg.label_smoothing,
+    )
+    ponder = enc_ponder.mean() + dec_ponder.mean()
+    return ce + cfg.act_ponder_penalty * ponder, ce.item(), ponder.item()
+
+
+def train(model, train_examples, cfg: Config, log_every=1):
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, betas=(0.9, 0.98), eps=1e-9)
+    rng = random.Random(cfg.seed)
+    global_step = 0
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        batches = make_batches(train_examples, cfg, rng=rng)
+        tot_ce, tot_ponder, nb = 0.0, 0.0, 0
+        for src, tgt in batches:
+            src, tgt = src.to(cfg.device), tgt.to(cfg.device)
+            global_step += 1
+            for g in opt.param_groups:
+                g["lr"] = lr_at(global_step, cfg)
+            opt.zero_grad()
+            loss, ce, ponder = compute_loss(model, src, tgt, cfg)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_threshold)
+            opt.step()
+            tot_ce += ce
+            tot_ponder += ponder
+            nb += 1
+        if epoch % log_every == 0 or epoch == 1:
+            print(
+                f"  epoch {epoch:3d}  ce {tot_ce/nb:6.4f}  "
+                f"ppl {math.exp(tot_ce/nb):7.3f}  avg_ponder {tot_ponder/nb:4.2f}"
+            )
+    return model
