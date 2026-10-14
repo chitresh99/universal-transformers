@@ -7,7 +7,9 @@ authors = [
     { name = "chitresh99", email = "chitreshpoojary990@gmail.com" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "black>=26.10.1",
+]
 
 [project.scripts]
 universal-transformers = "universal_transformers:main"
