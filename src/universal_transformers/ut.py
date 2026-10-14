@@ -448,3 +448,35 @@ def evaluate_by_task(model, examples, cfg: Config):
         if subset:
             results[task] = evaluate(model, subset, cfg)
     return results
+
+#####################
+# Sanity checks
+#####################
+
+def check_shapes(model, cfg: Config):
+    B, Ls, Lt = 4, 7, 9
+    V = vocab_size(cfg)
+    src = torch.randint(NUM_SPECIAL, V, (B, Ls))
+    tgt_in = torch.randint(NUM_SPECIAL, V, (B, Lt))
+    logits, enc_ponder, dec_ponder = model(src, tgt_in)
+    assert logits.shape == (B, Lt, V), logits.shape
+    assert enc_ponder.shape == (B, Ls), enc_ponder.shape
+    print(f"  logits          {tuple(logits.shape)}")
+    print(f"  enc ponder      {tuple(enc_ponder.shape)}  (steps per source position)")
+    print(f"  dec ponder      {tuple(dec_ponder.shape)}  (steps per target position)")
+    print(f"  max_steps (T)   {cfg.max_steps}")
+    print(f"  parameters      {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  tied block?     yes — one encoder block, one decoder block, reused T times")
+
+
+def check_overfit(cfg: Config):
+    """Can the model memorize 32 examples? If not, something is structurally broken."""
+    small = Config(**{**cfg.__dict__, "epochs": 60, "batch_size": 32,
+                      "train_examples": 32, "act_ponder_penalty": 0.0})
+    rng = random.Random(small.seed)
+    subset = [make_example(rng, small) for _ in range(32)]
+    model = UniversalTransformer(small).to(small.device)
+    train(model, subset, small, log_every=20)
+    char, seq = evaluate(model, subset, small)
+    print(f"  memorized       char-acc {char:.0%}  seq-acc {seq:.0%}  of 32 examples")
+    return seq
