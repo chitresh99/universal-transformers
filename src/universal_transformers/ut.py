@@ -387,3 +387,64 @@ def train(model, train_examples, cfg: Config, log_every=1):
                 f"ppl {math.exp(tot_ce/nb):7.3f}  avg_ponder {tot_ponder/nb:4.2f}"
             )
     return model
+
+############################
+# Decoding + evaluation
+############################
+
+
+@torch.no_grad()
+def greedy_decode(model, src, cfg: Config, max_len=None):
+    model.eval()
+    max_len = max_len or (cfg.max_len + 4)
+    enc, src_mask, _ = model.encode(src)
+    ys = torch.full((src.size(0), 1), SOS, dtype=torch.long, device=src.device)
+    for _ in range(max_len):
+        logits, _ = model.decode(ys, enc, src_mask)
+        nxt = logits[:, -1].argmax(-1, keepdim=True)
+        ys = torch.cat([ys, nxt], dim=1)
+        if (nxt == EOS).all():
+            break
+    return ys
+
+
+def strip(ids: List[int]) -> List[int]:
+    out = []
+    for i in ids:
+        if i == SOS:
+            continue
+        if i == EOS:
+            break
+        if i == PAD:
+            continue
+        out.append(i)
+    return out
+
+
+@torch.no_grad()
+def evaluate(model, examples, cfg: Config):
+    model.eval()
+    char_correct, char_total, seq_correct, seq_total = 0, 0, 0, 0
+    for batch in make_batches(examples, cfg, shuffle=False):
+        src, tgt = batch
+        src = src.to(cfg.device)
+        pred = greedy_decode(model, src, cfg)
+        for b in range(src.size(0)):
+            p = strip(pred[b].tolist())
+            g = strip(tgt[b].tolist())
+            seq_total += 1
+            seq_correct += int(p == g)
+            for k in range(len(g)):
+                char_total += 1
+                char_correct += int(k < len(p) and p[k] == g[k])
+    return char_correct / max(char_total, 1), seq_correct / max(seq_total, 1)
+
+
+@torch.no_grad()
+def evaluate_by_task(model, examples, cfg: Config):
+    results = {}
+    for task in cfg.tasks:
+        subset = [e for e in examples if e[0] == task]
+        if subset:
+            results[task] = evaluate(model, subset, cfg)
+    return results
