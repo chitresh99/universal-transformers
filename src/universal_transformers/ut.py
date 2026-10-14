@@ -290,3 +290,44 @@ def act_halt(block, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
             break
 
     return previous_state, n_updates
+
+
+###################
+# Model
+###################
+
+
+class UniversalTransformer(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        V = vocab_size(cfg)
+        self.src_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
+        self.tgt_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
+        self.encoder = UTBlock(cfg, is_decoder=False)
+        self.decoder = UTBlock(cfg, is_decoder=True)
+        self.generator = nn.Linear(cfg.d_model, V)
+        self.scale = math.sqrt(cfg.d_model)
+
+    def encode(self, src):
+        src_mask = (src != PAD).unsqueeze(1).unsqueeze(1)  # (B,1,1,Ls)
+        h = self.src_embed(src) * self.scale
+        enc, enc_ponder = act_halt(self.encoder, h, self.cfg, self_mask=src_mask)
+        return enc, src_mask, enc_ponder
+
+    def decode(self, tgt_in, enc, src_mask):
+        B, Lt = tgt_in.shape
+        device = tgt_in.device
+        pad_mask = (tgt_in != PAD).unsqueeze(1).unsqueeze(1)  # (B,1,1,Lt)
+        causal = torch.tril(torch.ones(Lt, Lt, device=device)).bool()  # (Lt,Lt)
+        self_mask = pad_mask & causal.unsqueeze(0).unsqueeze(0)
+        h = self.tgt_embed(tgt_in) * self.scale
+        dec, dec_ponder = act_halt(
+            self.decoder, h, self.cfg, self_mask=self_mask, enc=enc, cross_mask=src_mask
+        )
+        return self.generator(dec), dec_ponder
+
+    def forward(self, src, tgt_in):
+        enc, src_mask, enc_ponder = self.encode(src)
+        logits, dec_ponder = self.decode(tgt_in, enc, src_mask)
+        return logits, enc_ponder, dec_ponder
