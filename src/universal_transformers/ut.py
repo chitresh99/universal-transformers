@@ -1,15 +1,11 @@
-from dataclasses import dataclass
-from typing import Tuple, List
-import random
 import math
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-####################
-# Config
-####################
 
 
 @dataclass
@@ -33,18 +29,14 @@ class Config:
     lr: float = 3e-4
     warmup_steps: int = 400
     clip_threshold: float = 1.0
-    epochs: int = 12
+    epochs: int = 30
     label_smoothing: float = 0.0
 
-    act_ponder_penalty: float = 1e-2
+    act_ponder_penalty: float = 1e-3
 
     seed: int = 0
     device: str = "cpu"
 
-
-#############################
-# universal / special tokens
-#############################
 
 PAD, SOS, EOS = 0, 1, 2
 NUM_SPECIAL = 3
@@ -70,11 +62,6 @@ def decode_tokens(ids: List[int]) -> List[str]:
         else:
             out.append(f"s{i - NUM_SPECIAL}")
     return out
-
-
-##########################
-# Data
-##########################
 
 
 def make_example(rng: random.Random, cfg: Config) -> Tuple[str, List[int], List[int]]:
@@ -109,7 +96,7 @@ def tensorize(example) -> Tuple[List[int], List[int]]:
 
 def make_batches(examples, cfg: Config, rng=None, shuffle=True):
     data = [tensorize(e) for e in examples]
-    data.sort(key=lambda x: len(x[0]))  # length bucket to minimize padding
+    data.sort(key=lambda x: len(x[0]))
     batches = []
     for i in range(0, len(data), cfg.batch_size):
         chunk = data[i : i + cfg.batch_size]
@@ -126,42 +113,15 @@ def make_batches(examples, cfg: Config, rng=None, shuffle=True):
     return batches
 
 
-################################################
-# Coordinate (position + timestep) embedding
-################################################
-
-
 def coordinate_embedding(seq_len: int, step: int, d_model: int, device) -> torch.Tensor:
-    pos = (
-        torch.arange(seq_len, device=device).unsqueeze(1).float()
-    )  # positions 0..L-1 as a column (L,1), so it broadcasts over dims
-    j = torch.arange(
-        0, d_model, 2, device=device
-    ).float()  # even dim indices 0,2,4,..... -> one entry per sin/cos pair (d/2,)
-    div = torch.pow(
-        10000.0, j / d_model
-    )  # per-dimension divisors 10000^(2j/d): big->low freq, small->high freq
-
-    # The timestep term uses the SAME per-dimension frequency as the position term
-    # (sin/cos of t / 10000^{2j/d}), NOT a scalar sin(t).
-    t = torch.tensor(
-        float(step), device=device
-    )  # current recurrent step as a scalar tensor
-    pe = torch.zeros(
-        seq_len, d_model, device=device
-    )  # empty table (L, d_model) to fill with the coordinate embedding
-    pe[:, 0::2] = torch.sin(pos / div) + torch.sin(
-        t / div
-    )  # EVEN dims: sine of position + sine of timestep, summed (Eqn 6)
-    pe[:, 1::2] = torch.cos(pos / div) + torch.cos(
-        t / div
-    )  # ODD dims: cosine of position + cosine of timestep, summed (Eqn 7)
-    return pe  # (L, d_model) one coordinate embedding for THIS step, added to the state in act_halt
-
-
-#####################################
-# Recurrent block (shared across time steps)
-#####################################
+    pos = torch.arange(seq_len, device=device).unsqueeze(1).float()
+    j = torch.arange(0, d_model, 2, device=device).float()
+    div = torch.pow(10000.0, j / d_model)
+    t = torch.tensor(float(step), device=device)
+    pe = torch.zeros(seq_len, d_model, device=device)
+    pe[:, 0::2] = torch.sin(pos / div) + torch.sin(t / div)
+    pe[:, 1::2] = torch.cos(pos / div) + torch.cos(t / div)
+    return pe
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -191,7 +151,7 @@ class MultiHeadSelfAttention(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float("-inf"))
         attn = self.drop(F.softmax(scores, dim=-1))
-        ctx = torch.matmul(attn, V)  # (B, h, Lq, dk)
+        ctx = torch.matmul(attn, V)
         ctx = ctx.transpose(1, 2).contiguous().view(B, Lq, self.h * self.dk)
         return self.o(ctx)
 
@@ -222,6 +182,7 @@ class UTBlock(nn.Module):
         self.transition = Transition(cfg)
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
+        self.halt = nn.Linear(cfg.d_model, 1)
 
     def forward(self, h, self_mask=None, enc=None, cross_mask=None):
         a = self.self_attn(h, h, mask=self_mask)
@@ -234,12 +195,7 @@ class UTBlock(nn.Module):
         return h
 
 
-#########################
-# ACT dynamic halting
-#########################
-
-
-def act_halt(block, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
+def act_halt(block: UTBlock, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
     device = h0.device
     B, L, D = h0.shape
     threshold = 1.0 - cfg.act_epsilon
@@ -248,53 +204,33 @@ def act_halt(block, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
     remainders = torch.zeros(B, L, device=device)
     n_updates = torch.zeros(B, L, device=device)
     state = h0
-    previous_state = torch.zeros_like(h0)
-
-    if not hasattr(block, "halt_prob"):
-        block.halt_prob = nn.Linear(D, 1).to(device)
 
     step = 0
     while step < cfg.max_steps:
-        still_running = (halting_prob < 1.0).float()  # (B, L)
-        state = state + coordinate_embedding(L, step + 1, D, device).unsqueeze(0)
-        p = torch.sigmoid(block.halt_prob(state)).squeeze(-1)  # (B, L)
-        new_halted = (
-            (halting_prob + p * still_running) > threshold
-        ).float() * still_running
-        still_running_after = (
-            (halting_prob + p * still_running) <= threshold
-        ).float() * still_running
-        new_halted = (
-            (halting_prob + p * still_running) > threshold
-        ).float() * still_running
-        still_running_after = (
-            (halting_prob + p * still_running) <= threshold
-        ).float() * still_running
-        halting_prob = halting_prob + p * still_running_after
+        still_running = (halting_prob < 1.0).float()
+
+        coord = coordinate_embedding(L, step + 1, D, device).unsqueeze(0)
+        p = torch.sigmoid(block.halt(state + coord)).squeeze(-1)
+
+        new_halted = ((halting_prob + p * still_running) > threshold).float() * still_running
+        still_running = ((halting_prob + p * still_running) <= threshold).float() * still_running
+
+        halting_prob = halting_prob + p * still_running
         remainders = remainders + new_halted * (1.0 - halting_prob)
         halting_prob = halting_prob + new_halted * remainders
-        n_updates = n_updates + still_running
+        n_updates = n_updates + still_running + new_halted
 
-        update_weights = (p * still_running_after + new_halted * remainders).unsqueeze(
-            -1
-        )
+        update_weights = (p * still_running + new_halted * remainders).unsqueeze(-1)
 
-        transformed = block(state, self_mask=self_mask, enc=enc, cross_mask=cross_mask)
-        previous_state = transformed * update_weights + previous_state * (
-            1 - update_weights
-        )
-        state = transformed
+        transformed = block(state + coord, self_mask=self_mask, enc=enc, cross_mask=cross_mask)
+        state = transformed * update_weights + state * (1.0 - update_weights)
 
         step += 1
         if still_running.sum() == 0:
             break
 
-    return previous_state, n_updates
-
-
-###################
-# Model
-###################
+    ponder_cost = (n_updates + remainders).mean()
+    return state, ponder_cost, n_updates.detach()
 
 
 class UniversalTransformer(nn.Module):
@@ -310,54 +246,46 @@ class UniversalTransformer(nn.Module):
         self.scale = math.sqrt(cfg.d_model)
 
     def encode(self, src):
-        src_mask = (src != PAD).unsqueeze(1).unsqueeze(1)  # (B,1,1,Ls)
+        src_mask = (src != PAD).unsqueeze(1).unsqueeze(1)
         h = self.src_embed(src) * self.scale
-        enc, enc_ponder = act_halt(self.encoder, h, self.cfg, self_mask=src_mask)
-        return enc, src_mask, enc_ponder
+        enc, enc_pc, enc_n = act_halt(self.encoder, h, self.cfg, self_mask=src_mask)
+        return enc, src_mask, enc_pc, enc_n
 
     def decode(self, tgt_in, enc, src_mask):
         B, Lt = tgt_in.shape
         device = tgt_in.device
-        pad_mask = (tgt_in != PAD).unsqueeze(1).unsqueeze(1)  # (B,1,1,Lt)
-        causal = torch.tril(torch.ones(Lt, Lt, device=device)).bool()  # (Lt,Lt)
+        pad_mask = (tgt_in != PAD).unsqueeze(1).unsqueeze(1)
+        causal = torch.tril(torch.ones(Lt, Lt, device=device)).bool()
         self_mask = pad_mask & causal.unsqueeze(0).unsqueeze(0)
         h = self.tgt_embed(tgt_in) * self.scale
-        dec, dec_ponder = act_halt(
+        dec, dec_pc, dec_n = act_halt(
             self.decoder, h, self.cfg, self_mask=self_mask, enc=enc, cross_mask=src_mask
         )
-        return self.generator(dec), dec_ponder
+        return self.generator(dec), dec_pc, dec_n
 
     def forward(self, src, tgt_in):
-        enc, src_mask, enc_ponder = self.encode(src)
-        logits, dec_ponder = self.decode(tgt_in, enc, src_mask)
-        return logits, enc_ponder, dec_ponder
-
-
-#####################
-# Training
-#####################
+        enc, src_mask, enc_pc, enc_n = self.encode(src)
+        logits, dec_pc, dec_n = self.decode(tgt_in, enc, src_mask)
+        return logits, enc_pc + dec_pc, enc_n, dec_n
 
 
 def lr_at(step, cfg: Config):
     step = max(step, 1)
-    return (
-        cfg.lr
-        * min(step**-0.5, step * cfg.warmup_steps**-1.5)
-        * (cfg.warmup_steps**0.5)
-    )
+    return cfg.lr * min(step ** -0.5, step * cfg.warmup_steps ** -1.5) * (cfg.warmup_steps ** 0.5)
 
 
 def compute_loss(model, src, tgt, cfg: Config):
     tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
-    logits, enc_ponder, dec_ponder = model(src, tgt_in)
+    logits, ponder_cost, enc_n, dec_n = model(src, tgt_in)
     ce = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         tgt_out.reshape(-1),
         ignore_index=PAD,
         label_smoothing=cfg.label_smoothing,
     )
-    ponder = enc_ponder.mean() + dec_ponder.mean()
-    return ce + cfg.act_ponder_penalty * ponder, ce.item(), ponder.item()
+    loss = ce + cfg.act_ponder_penalty * ponder_cost
+    avg_steps = 0.5 * (enc_n.float().mean().item() + dec_n.float().mean().item())
+    return loss, ce.item(), avg_steps
 
 
 def train(model, train_examples, cfg: Config, log_every=1):
@@ -367,40 +295,36 @@ def train(model, train_examples, cfg: Config, log_every=1):
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         batches = make_batches(train_examples, cfg, rng=rng)
-        tot_ce, tot_ponder, nb = 0.0, 0.0, 0
+        tot_ce, tot_steps, nb = 0.0, 0.0, 0
         for src, tgt in batches:
             src, tgt = src.to(cfg.device), tgt.to(cfg.device)
             global_step += 1
             for g in opt.param_groups:
                 g["lr"] = lr_at(global_step, cfg)
             opt.zero_grad()
-            loss, ce, ponder = compute_loss(model, src, tgt, cfg)
+            loss, ce, avg_steps = compute_loss(model, src, tgt, cfg)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_threshold)
             opt.step()
             tot_ce += ce
-            tot_ponder += ponder
+            tot_steps += avg_steps
             nb += 1
         if epoch % log_every == 0 or epoch == 1:
             print(
                 f"  epoch {epoch:3d}  ce {tot_ce/nb:6.4f}  "
-                f"ppl {math.exp(tot_ce/nb):7.3f}  avg_ponder {tot_ponder/nb:4.2f}"
+                f"ppl {math.exp(tot_ce/nb):7.3f}  avg_steps {tot_steps/nb:4.2f}"
             )
     return model
-
-############################
-# Decoding + evaluation
-############################
 
 
 @torch.no_grad()
 def greedy_decode(model, src, cfg: Config, max_len=None):
     model.eval()
     max_len = max_len or (cfg.max_len + 4)
-    enc, src_mask, _ = model.encode(src)
+    enc, src_mask, _, _ = model.encode(src)
     ys = torch.full((src.size(0), 1), SOS, dtype=torch.long, device=src.device)
     for _ in range(max_len):
-        logits, _ = model.decode(ys, enc, src_mask)
+        logits, _, _ = model.decode(ys, enc, src_mask)
         nxt = logits[:, -1].argmax(-1, keepdim=True)
         ys = torch.cat([ys, nxt], dim=1)
         if (nxt == EOS).all():
@@ -449,41 +373,35 @@ def evaluate_by_task(model, examples, cfg: Config):
             results[task] = evaluate(model, subset, cfg)
     return results
 
-#####################
-# Sanity checks
-#####################
 
 def check_shapes(model, cfg: Config):
     B, Ls, Lt = 4, 7, 9
     V = vocab_size(cfg)
     src = torch.randint(NUM_SPECIAL, V, (B, Ls))
     tgt_in = torch.randint(NUM_SPECIAL, V, (B, Lt))
-    logits, enc_ponder, dec_ponder = model(src, tgt_in)
+    logits, ponder_cost, enc_n, dec_n = model(src, tgt_in)
     assert logits.shape == (B, Lt, V), logits.shape
-    assert enc_ponder.shape == (B, Ls), enc_ponder.shape
+    assert enc_n.shape == (B, Ls), enc_n.shape
+    assert enc_n.max().item() <= cfg.max_steps, "ponder exceeds max_steps"
     print(f"  logits          {tuple(logits.shape)}")
-    print(f"  enc ponder      {tuple(enc_ponder.shape)}  (steps per source position)")
-    print(f"  dec ponder      {tuple(dec_ponder.shape)}  (steps per target position)")
+    print(f"  enc ponder      {tuple(enc_n.shape)}  (steps per source position)")
+    print(f"  dec ponder      {tuple(dec_n.shape)}  (steps per target position)")
+    print(f"  ponder range    [{enc_n.min():.0f}, {enc_n.max():.0f}] of max {cfg.max_steps}")
     print(f"  max_steps (T)   {cfg.max_steps}")
     print(f"  parameters      {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  tied block?     yes — one encoder block, one decoder block, reused T times")
+    print(f"  tied block?     yes")
 
 
 def check_overfit(cfg: Config):
-    """Can the model memorize 32 examples? If not, something is structurally broken."""
-    small = Config(**{**cfg.__dict__, "epochs": 60, "batch_size": 32,
-                      "train_examples": 32, "act_ponder_penalty": 0.0})
+    small = Config(**{**cfg.__dict__, "epochs": 200, "batch_size": 32,
+                      "train_examples": 32, "act_ponder_penalty": 0.0, "dropout": 0.0})
     rng = random.Random(small.seed)
     subset = [make_example(rng, small) for _ in range(32)]
     model = UniversalTransformer(small).to(small.device)
-    train(model, subset, small, log_every=20)
+    train(model, subset, small, log_every=50)
     char, seq = evaluate(model, subset, small)
     print(f"  memorized       char-acc {char:.0%}  seq-acc {seq:.0%}  of 32 examples")
     return seq
-
-#####################################
-# Main
-#####################################
 
 
 def main():
@@ -528,15 +446,15 @@ def main():
         si, _ = tensorize(ex)
         src = torch.tensor([si], device=cfg.device)
         with torch.no_grad():
-            enc, src_mask, enc_ponder = model.encode(src)
+            enc, src_mask, _, enc_n = model.encode(src)
             pred = greedy_decode(model, src, cfg)
         p = strip(pred[0].tolist())
         print(f"  task            {ex[0]}")
         print(f"  source          {decode_tokens(ex[1])}")
         print(f"  target          {decode_tokens(ex[2])}")
         print(f"  predicted       {decode_tokens(p)}")
-        ponder = enc_ponder[0].tolist()
-        print(f"  enc ponder/pos  {[round(x, 1) for x in ponder]}  "
+        ponder = enc_n[0].tolist()
+        print(f"  enc ponder/pos  {[int(x) for x in ponder]}  "
               f"(avg {sum(ponder)/len(ponder):.2f} of max {cfg.max_steps})")
         print()
 
