@@ -231,4 +231,62 @@ class UTBlock(nn.Module):
             h = self.norm_cross(h + self.drop(c))
         t = self.transition(h)
         h = self.norm2(h + self.drop(t))
-        return h    
+        return h
+
+
+#########################
+# ACT dynamic halting
+#########################
+
+
+def act_halt(block, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
+    device = h0.device
+    B, L, D = h0.shape
+    threshold = 1.0 - cfg.act_epsilon
+
+    halting_prob = torch.zeros(B, L, device=device)
+    remainders = torch.zeros(B, L, device=device)
+    n_updates = torch.zeros(B, L, device=device)
+    state = h0
+    previous_state = torch.zeros_like(h0)
+
+    if not hasattr(block, "halt_prob"):
+        block.halt_prob = nn.Linear(D, 1).to(device)
+
+    step = 0
+    while step < cfg.max_steps:
+        still_running = (halting_prob < 1.0).float()  # (B, L)
+        state = state + coordinate_embedding(L, step + 1, D, device).unsqueeze(0)
+        p = torch.sigmoid(block.halt_prob(state)).squeeze(-1)  # (B, L)
+        new_halted = (
+            (halting_prob + p * still_running) > threshold
+        ).float() * still_running
+        still_running_after = (
+            (halting_prob + p * still_running) <= threshold
+        ).float() * still_running
+        new_halted = (
+            (halting_prob + p * still_running) > threshold
+        ).float() * still_running
+        still_running_after = (
+            (halting_prob + p * still_running) <= threshold
+        ).float() * still_running
+        halting_prob = halting_prob + p * still_running_after
+        remainders = remainders + new_halted * (1.0 - halting_prob)
+        halting_prob = halting_prob + new_halted * remainders
+        n_updates = n_updates + still_running
+
+        update_weights = (p * still_running_after + new_halted * remainders).unsqueeze(
+            -1
+        )
+
+        transformed = block(state, self_mask=self_mask, enc=enc, cross_mask=cross_mask)
+        previous_state = transformed * update_weights + previous_state * (
+            1 - update_weights
+        )
+        state = transformed
+
+        step += 1
+        if still_running.sum() == 0:
+            break
+
+    return previous_state, n_updates
