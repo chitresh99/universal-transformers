@@ -39,11 +39,16 @@ class Config:
 
 
 PAD, SOS, EOS = 0, 1, 2
-NUM_SPECIAL = 3
+TASK_NAMES = ("copy", "reverse", "sort")
+NUM_SPECIAL = 3 + len(TASK_NAMES)
 
 
 def vocab_size(cfg: Config) -> int:
     return NUM_SPECIAL + cfg.num_symbols
+
+
+def task_id(task: str) -> int:
+    return 3 + TASK_NAMES.index(task)
 
 
 def symbol_id(k: int) -> int:
@@ -59,6 +64,8 @@ def decode_tokens(ids: List[int]) -> List[str]:
             out.append("<sos>")
         elif i == EOS:
             out.append("<eos>")
+        elif i < NUM_SPECIAL:
+            out.append(f"<{TASK_NAMES[i - 3]}>")
         else:
             out.append(f"s{i - NUM_SPECIAL}")
     return out
@@ -88,8 +95,8 @@ def build_dataset(cfg: Config):
 
 
 def tensorize(example) -> Tuple[List[int], List[int]]:
-    _, src, tgt = example
-    src_ids = list(src) + [EOS]
+    task, src, tgt = example
+    src_ids = [task_id(task)] + list(src) + [EOS]
     tgt_ids = [SOS] + list(tgt) + [EOS]
     return src_ids, tgt_ids
 
@@ -240,6 +247,10 @@ class UniversalTransformer(nn.Module):
         V = vocab_size(cfg)
         self.src_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
         self.tgt_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
+        for emb in (self.src_embed, self.tgt_embed):
+            nn.init.normal_(emb.weight, 0.0, cfg.d_model ** -0.5)
+            with torch.no_grad():
+                emb.weight[PAD].zero_()
         self.encoder = UTBlock(cfg, is_decoder=False)
         self.decoder = UTBlock(cfg, is_decoder=True)
         self.generator = nn.Linear(cfg.d_model, V)
@@ -393,8 +404,9 @@ def check_shapes(model, cfg: Config):
 
 
 def check_overfit(cfg: Config):
-    small = Config(**{**cfg.__dict__, "epochs": 200, "batch_size": 32,
-                      "train_examples": 32, "act_ponder_penalty": 0.0, "dropout": 0.0})
+    small = Config(**{**cfg.__dict__, "epochs": 300, "batch_size": 8,
+                      "train_examples": 32, "warmup_steps": 100, "lr": 1e-3,
+                      "act_ponder_penalty": 0.0, "dropout": 0.0})
     rng = random.Random(small.seed)
     subset = [make_example(rng, small) for _ in range(32)]
     model = UniversalTransformer(small).to(small.device)
@@ -417,7 +429,7 @@ def main():
     print(f"  source          {decode_tokens(src)}")
     print(f"  target          {decode_tokens(tgt)}")
     si, ti = tensorize(train_ex[0])
-    print(f"  source ids      {si}   (content + <eos>)")
+    print(f"  source ids      {si}   (<task> + content + <eos>)")
     print(f"  target ids      {ti}   (<sos> + content + <eos>)")
     print(f"  vocab           {vocab_size(cfg)} ({cfg.num_symbols} content symbols)")
     print(f"  tasks           {cfg.tasks}   len {cfg.min_len}-{cfg.max_len}")
@@ -432,7 +444,7 @@ def main():
 
     print("\nTraining")
     model = UniversalTransformer(cfg).to(cfg.device)
-    train(model, train_ex, cfg)
+    train(model, train_ex, cfg, log_every=5)
 
     print("\nHeld-out accuracy (char-acc / seq-acc)")
     for task, (char, seq) in evaluate_by_task(model, valid_ex, cfg).items():
@@ -455,7 +467,7 @@ def main():
         print(f"  predicted       {decode_tokens(p)}")
         ponder = enc_n[0].tolist()
         print(f"  enc ponder/pos  {[int(x) for x in ponder]}  "
-              f"(avg {sum(ponder)/len(ponder):.2f} of max {cfg.max_steps})")
+              f"(avg {sum(ponder)/len(ponder):.2f} of max {cfg.max_steps}, incl. <task> and <eos>)")
         print()
 
 
