@@ -8,6 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+######################
+# Config
+######################
+
+
 @dataclass
 class Config:
     d_model: int = 128
@@ -38,7 +43,14 @@ class Config:
     device: str = "cpu"
 
 
+######################
+# Vocabulary
+######################
+
+
 PAD, SOS, EOS = 0, 1, 2
+# each source starts with a task token so one model can learn all tasks.
+# without it, the same source would have several correct targets.
 TASK_NAMES = ("copy", "reverse", "sort")
 NUM_SPECIAL = 3 + len(TASK_NAMES)
 
@@ -69,6 +81,11 @@ def decode_tokens(ids: List[int]) -> List[str]:
         else:
             out.append(f"s{i - NUM_SPECIAL}")
     return out
+
+
+######################
+# Data
+######################
 
 
 def make_example(rng: random.Random, cfg: Config) -> Tuple[str, List[int], List[int]]:
@@ -102,6 +119,8 @@ def tensorize(example) -> Tuple[List[int], List[int]]:
 
 
 def make_batches(examples, cfg: Config, rng=None, shuffle=True):
+    # sorting by length keeps padding low; shuffling the batch order
+    # (not the examples) keeps training from seeing lengths in order.
     data = [tensorize(e) for e in examples]
     data.sort(key=lambda x: len(x[0]))
     batches = []
@@ -120,7 +139,15 @@ def make_batches(examples, cfg: Config, rng=None, shuffle=True):
     return batches
 
 
+######################
+# Coordinate embedding
+######################
+
+
 def coordinate_embedding(seq_len: int, step: int, d_model: int, device) -> torch.Tensor:
+    # paper eqns 6-7: a sinusoidal position term plus a sinusoidal timestep
+    # term, both over the same frequency bank, so the block knows where each
+    # position is and which refinement step it is on.
     pos = torch.arange(seq_len, device=device).unsqueeze(1).float()
     j = torch.arange(0, d_model, 2, device=device).float()
     div = torch.pow(10000.0, j / d_model)
@@ -129,6 +156,11 @@ def coordinate_embedding(seq_len: int, step: int, d_model: int, device) -> torch
     pe[:, 0::2] = torch.sin(pos / div) + torch.sin(t / div)
     pe[:, 1::2] = torch.cos(pos / div) + torch.cos(t / div)
     return pe
+
+
+######################
+# Model
+######################
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -189,9 +221,13 @@ class UTBlock(nn.Module):
         self.transition = Transition(cfg)
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
+        # halting unit for act. created here, not lazily, so the optimizer
+        # always sees its parameters.
         self.halt = nn.Linear(cfg.d_model, 1)
 
     def forward(self, h, self_mask=None, enc=None, cross_mask=None):
+        # one refinement step (paper eqns 4-5). h already includes the
+        # coordinate embedding. the same block is reused at every step.
         a = self.self_attn(h, h, mask=self_mask)
         h = self.norm1(h + self.drop(a))
         if self.is_decoder:
@@ -202,7 +238,15 @@ class UTBlock(nn.Module):
         return h
 
 
+######################
+# Adaptive Computation Time
+######################
+
+
 def act_halt(block: UTBlock, h0, cfg: Config, self_mask=None, enc=None, cross_mask=None):
+    # dynamic halting from paper appendix c (act, graves 2016). each position
+    # accumulates halting probability step by step and stops once the sum
+    # passes the threshold. all tensors below are per position, shape (b, l).
     device = h0.device
     B, L, D = h0.shape
     threshold = 1.0 - cfg.act_epsilon
@@ -219,25 +263,41 @@ def act_halt(block: UTBlock, h0, cfg: Config, self_mask=None, enc=None, cross_ma
         coord = coordinate_embedding(L, step + 1, D, device).unsqueeze(0)
         p = torch.sigmoid(block.halt(state + coord)).squeeze(-1)
 
+        # positions that cross the threshold this step halt now; the rest
+        # keep running.
         new_halted = ((halting_prob + p * still_running) > threshold).float() * still_running
         still_running = ((halting_prob + p * still_running) <= threshold).float() * still_running
 
         halting_prob = halting_prob + p * still_running
+        # a halting position gets the leftover probability (the remainder)
+        # as its final weight, so its weights over all steps sum to 1.
         remainders = remainders + new_halted * (1.0 - halting_prob)
         halting_prob = halting_prob + new_halted * remainders
         n_updates = n_updates + still_running + new_halted
 
+        # weight of this step's update: p if still running, the remainder if
+        # halting now, 0 if already halted.
         update_weights = (p * still_running + new_halted * remainders).unsqueeze(-1)
 
         transformed = block(state + coord, self_mask=self_mask, enc=enc, cross_mask=cross_mask)
+        # a weight of 0 leaves the state unchanged, which is how halted
+        # positions stay frozen.
         state = transformed * update_weights + state * (1.0 - update_weights)
 
         step += 1
         if still_running.sum() == 0:
             break
 
+    # n_updates is a count with no gradient; the remainders are what the
+    # optimizer can move, so they carry the penalty. averaged over all
+    # positions, padding included.
     ponder_cost = (n_updates + remainders).mean()
     return state, ponder_cost, n_updates.detach()
+
+
+######################
+# Universal Transformer
+######################
 
 
 class UniversalTransformer(nn.Module):
@@ -247,6 +307,9 @@ class UniversalTransformer(nn.Module):
         V = vocab_size(cfg)
         self.src_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
         self.tgt_embed = nn.Embedding(V, cfg.d_model, padding_idx=PAD)
+        # embeddings are scaled by sqrt(d_model) in encode/decode. starting at
+        # std d_model^-0.5 makes them about 1 after scaling, the same size as
+        # the coordinate embedding. pytorch's default (std 1) would swamp it.
         for emb in (self.src_embed, self.tgt_embed):
             nn.init.normal_(emb.weight, 0.0, cfg.d_model ** -0.5)
             with torch.no_grad():
@@ -280,12 +343,21 @@ class UniversalTransformer(nn.Module):
         return logits, enc_pc + dec_pc, enc_n, dec_n
 
 
+######################
+# Training
+######################
+
+
 def lr_at(step, cfg: Config):
+    # linear warmup, then decay with 1 / sqrt(step). the last factor rescales
+    # it so the peak, at step == warmup_steps, equals cfg.lr.
     step = max(step, 1)
     return cfg.lr * min(step ** -0.5, step * cfg.warmup_steps ** -1.5) * (cfg.warmup_steps ** 0.5)
 
 
 def compute_loss(model, src, tgt, cfg: Config):
+    # teacher forcing: the decoder reads the target shifted right and predicts
+    # it shifted left.
     tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
     logits, ponder_cost, enc_n, dec_n = model(src, tgt_in)
     ce = F.cross_entropy(
@@ -295,6 +367,8 @@ def compute_loss(model, src, tgt, cfg: Config):
         label_smoothing=cfg.label_smoothing,
     )
     loss = ce + cfg.act_ponder_penalty * ponder_cost
+    # for logging only. includes padding positions, so it is lower than the
+    # per-task figures from ponder_by_task.
     avg_steps = 0.5 * (enc_n.float().mean().item() + dec_n.float().mean().item())
     return loss, ce.item(), avg_steps
 
@@ -328,6 +402,11 @@ def train(model, train_examples, cfg: Config, log_every=1):
     return model
 
 
+######################
+# Decoding
+######################
+
+
 @torch.no_grad()
 def greedy_decode(model, src, cfg: Config, max_len=None):
     model.eval()
@@ -338,6 +417,8 @@ def greedy_decode(model, src, cfg: Config, max_len=None):
         logits, _, _ = model.decode(ys, enc, src_mask)
         nxt = logits[:, -1].argmax(-1, keepdim=True)
         ys = torch.cat([ys, nxt], dim=1)
+        # decodes the whole batch until every sequence has produced <eos>;
+        # strip() cuts each one at its own first <eos>.
         if (nxt == EOS).all():
             break
     return ys
@@ -356,6 +437,11 @@ def strip(ids: List[int]) -> List[int]:
     return out
 
 
+######################
+# Evaluation
+######################
+
+
 @torch.no_grad()
 def evaluate(model, examples, cfg: Config):
     model.eval()
@@ -369,6 +455,8 @@ def evaluate(model, examples, cfg: Config):
             g = strip(tgt[b].tolist())
             seq_total += 1
             seq_correct += int(p == g)
+            # character accuracy compares position by position, so a missing
+            # or extra token shifts everything after it.
             for k in range(len(g)):
                 char_total += 1
                 char_correct += int(k < len(p) and p[k] == g[k])
@@ -414,6 +502,11 @@ def ponder_by_task(model, examples, cfg: Config):
     return results
 
 
+######################
+# Checks
+######################
+
+
 def check_shapes(model, cfg: Config):
     B, Ls, Lt = 4, 7, 9
     V = vocab_size(cfg)
@@ -433,6 +526,9 @@ def check_shapes(model, cfg: Config):
 
 
 def check_overfit(cfg: Config):
+    # a correct model must memorise 32 examples. dropout and the ponder penalty
+    # are off so nothing works against memorisation, and the small batch and
+    # short warmup let the learning rate actually reach its peak.
     small = Config(**{**cfg.__dict__, "epochs": 300, "batch_size": 8,
                       "train_examples": 32, "warmup_steps": 100, "lr": 1e-3,
                       "act_ponder_penalty": 0.0, "dropout": 0.0})
@@ -443,6 +539,11 @@ def check_overfit(cfg: Config):
     char, seq = evaluate(model, subset, small)
     print(f"  memorized       char-acc {char:.0%}  seq-acc {seq:.0%}  of 32 examples")
     return seq
+
+
+######################
+# Main
+######################
 
 
 def main():
