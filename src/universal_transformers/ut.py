@@ -17,7 +17,7 @@ class Config:
     dropout: float = 0.1
     act_epsilon: float = 0.01
 
-    tasks: Tuple[str, ...] = ("copy", "reverse")
+    tasks: Tuple[str, ...] = ("copy", "reverse", "sort")
     num_symbols: int = 12
     min_len: int = 4
     max_len: int = 10
