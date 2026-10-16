@@ -385,6 +385,35 @@ def evaluate_by_task(model, examples, cfg: Config):
     return results
 
 
+@torch.no_grad()
+def ponder_by_task(model, examples, cfg: Config):
+    """average ponder steps per task, on content positions only.
+
+    encoder: source symbols, excluding <task>, <eos> and padding.
+    decoder: teacher-forced target positions, excluding padding.
+    at cap: share of encoder content positions that hit max_steps.
+    """
+    model.eval()
+    results = {}
+    for task in cfg.tasks:
+        subset = [e for e in examples if e[0] == task]
+        if not subset:
+            continue
+        enc_sum = enc_cnt = enc_cap = dec_sum = dec_cnt = 0.0
+        for src, tgt in make_batches(subset, cfg, shuffle=False):
+            src, tgt = src.to(cfg.device), tgt.to(cfg.device)
+            _, _, enc_n, dec_n = model(src, tgt[:, :-1])
+            content = (src >= NUM_SPECIAL).float()
+            enc_sum += (enc_n * content).sum().item()
+            enc_cnt += content.sum().item()
+            enc_cap += ((enc_n >= cfg.max_steps).float() * content).sum().item()
+            real = (tgt[:, :-1] != PAD).float()
+            dec_sum += (dec_n * real).sum().item()
+            dec_cnt += real.sum().item()
+        results[task] = (enc_sum / enc_cnt, dec_sum / dec_cnt, enc_cap / enc_cnt)
+    return results
+
+
 def check_shapes(model, cfg: Config):
     B, Ls, Lt = 4, 7, 9
     V = vocab_size(cfg)
@@ -451,6 +480,10 @@ def main():
         print(f"  {task:8s}        char {char:.1%}   seq {seq:.1%}")
     char, seq = evaluate(model, valid_ex, cfg)
     print(f"  {'overall':8s}        char {char:.1%}   seq {seq:.1%}")
+
+    print(f"\nPonder by task (held-out, content positions, max {cfg.max_steps})")
+    for task, (enc_avg, dec_avg, at_cap) in ponder_by_task(model, valid_ex, cfg).items():
+        print(f"  {task:8s}        enc {enc_avg:.2f}   dec {dec_avg:.2f}   enc at cap {at_cap:.0%}")
 
     print("\nSamples (with per-position ponder times)")
     model.eval()
